@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Airflow
+logs/
+airflow.db
+airflow.cfg
+
+# Docker volumes (données locales)
+.volumes/
+
+# IDE
+.vscode/settings.json
+.idea/

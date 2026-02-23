@@ -1,0 +1,191 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline Vélib' Métropole – Architecture temps réel
+# Kafka → Airflow → PostgreSQL
+# Compatible GitHub Codespaces
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.1
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow/airflow
+    AIRFLOW__CORE__FERNET_KEY: "81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs="
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # ── Dépendances Python installées au démarrage des containers Airflow ──
+    _PIP_ADDITIONAL_REQUIREMENTS: "kafka-python==2.0.2 psycopg2-binary==2.9.9"
+    # ── Connexion DWH (utilisée par le DAG et le consumer subprocess) ─────
+    POSTGRES_DSN: "postgresql://velib:velib@postgres-dwh:5432/velib_dwh"
+    AIRFLOW_CONN_VELIB_DWH: "postgresql://velib:velib@postgres-dwh:5432/velib_dwh"
+    # ── Kafka ─────────────────────────────────────────────────────────────
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./consumer:/opt/airflow/consumer
+    - ./config:/opt/airflow/config
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres-airflow:
+      condition: service_healthy
+
+services:
+
+  # ── Zookeeper (requis par Kafka) ───────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Kafka Broker ───────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"   # Accès depuis le terminal Codespace
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Communication inter-containers Docker uniquement
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_RETENTION_BYTES: 1073741824
+      # Réduit la mémoire JVM pour Codespaces (évite les OOM)
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ── Kafka UI (monitoring) ──────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  # ── PostgreSQL – Airflow metadata ──────────────────────────────────────────
+  postgres-airflow:
+    image: postgres:15
+    container_name: postgres-airflow
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - pg-airflow-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── PostgreSQL – Data Warehouse analytique ─────────────────────────────────
+  postgres-dwh:
+    image: postgres:15
+    container_name: postgres-dwh
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: velib
+      POSTGRES_PASSWORD: velib
+      POSTGRES_DB: velib_dwh
+    volumes:
+      - pg-dwh-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "velib", "-d", "velib_dwh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Producer Vélib' → Kafka ────────────────────────────────────────────────
+  producer:
+    build: ./producer
+    container_name: velib-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: velib-stations
+      VELIB_API_URL: "https://opendata.paris.fr/api/explore/v2.1/catalog/datasets/velib-disponibilite-en-temps-reel/records"
+      COLLECT_INTERVAL_SECONDS: 60
+    restart: unless-stopped
+
+  # ── Airflow – Init DB ──────────────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        pip install --quiet kafka-python==2.0.2 psycopg2-binary==2.9.9
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@velib.local
+    restart: "no"
+
+  # ── Airflow Webserver ──────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      postgres-dwh:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Airflow Scheduler ──────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+      postgres-dwh:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pg-airflow-data:
+  pg-dwh-data:
+  airflow-logs:

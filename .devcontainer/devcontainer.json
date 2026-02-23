@@ -1,0 +1,38 @@
+{
+  "name": "Vélib' Pipeline – Data Engineering",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
+
+  // Ports forwarded automatiquement dans Codespaces
+  "forwardPorts": [8080, 8081, 5433],
+  "portsAttributes": {
+    "8080": { "label": "Airflow UI", "onAutoForward": "notify" },
+    "8081": { "label": "Kafka UI",   "onAutoForward": "notify" },
+    "5433": { "label": "PostgreSQL DWH", "onAutoForward": "silent" }
+  },
+
+  // Features installées dans le container Codespace
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/python:1": { "version": "3.11" }
+  },
+
+  // Commande exécutée une seule fois à la création du Codespace
+  "postCreateCommand": "pip install --quiet kafka-python requests psycopg2-binary && echo '✅ Dépendances Python installées'",
+
+  // Commande exécutée à chaque démarrage du Codespace
+  "postStartCommand": "docker compose up -d && echo '✅ Stack démarrée – Airflow : http://localhost:8080 (admin/admin)'",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker",
+        "mtxr.sqltools",
+        "mtxr.sqltools-driver-pg"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
+    }
+  }
+}
