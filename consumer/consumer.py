@@ -1,3 +1,5 @@
+from __future__ import annotations  # Python 3.8 compat (Airflow 2.8.1)
+
 """
 Consumer Kafka → PostgreSQL (Data Warehouse)
 ============================================
