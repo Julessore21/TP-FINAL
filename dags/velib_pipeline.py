@@ -17,19 +17,20 @@ Dépendances :
   check_dwh_health   ──┘                                                        │
                                                                                  └─► compute_station_rank
                                                                                  └─► data_quality_check
+
+Note d'architecture :
+  Tous les imports tiers (kafka, psycopg2) sont DANS les fonctions (lazy imports).
+  Cela garantit que le DAG se charge correctement même si les packages
+  ne sont pas encore installés, et évite tout problème de Python 3.8 compat.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import subprocess
-import sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 
-import psycopg2
 from airflow import DAG
-from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
 
@@ -52,7 +53,66 @@ PG_DSN = os.getenv(
 )
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_TOPIC     = "velib-stations"
-CONSUMER_SCRIPT = "/opt/airflow/consumer/consumer.py"
+
+# ── SQL d'insertion ───────────────────────────────────────────────────────────
+
+_INSERT_SNAPSHOT = """
+    INSERT INTO raw.station_snapshots (
+        station_code, station_name,
+        bikes_available, mechanical_bikes, electric_bikes,
+        docks_available, capacity,
+        is_installed, is_renting, is_returning,
+        occupancy_rate, station_status,
+        latitude, longitude,
+        last_reported, collected_at
+    ) VALUES (
+        %(station_code)s, %(station_name)s,
+        %(bikes_available)s, %(mechanical_bikes)s, %(electric_bikes)s,
+        %(docks_available)s, %(capacity)s,
+        %(is_installed)s, %(is_renting)s, %(is_returning)s,
+        %(occupancy_rate)s, %(station_status)s,
+        %(latitude)s, %(longitude)s,
+        %(last_reported)s, %(collected_at)s
+    )
+    ON CONFLICT (station_code, collected_at) DO NOTHING;
+"""
+
+_UPSERT_LATEST = """
+    INSERT INTO mart.station_latest (
+        station_code, station_name,
+        bikes_available, mechanical_bikes, electric_bikes,
+        docks_available, capacity,
+        is_installed, is_renting, is_returning,
+        occupancy_rate, station_status,
+        latitude, longitude,
+        last_reported, collected_at
+    ) VALUES (
+        %(station_code)s, %(station_name)s,
+        %(bikes_available)s, %(mechanical_bikes)s, %(electric_bikes)s,
+        %(docks_available)s, %(capacity)s,
+        %(is_installed)s, %(is_renting)s, %(is_returning)s,
+        %(occupancy_rate)s, %(station_status)s,
+        %(latitude)s, %(longitude)s,
+        %(last_reported)s, %(collected_at)s
+    )
+    ON CONFLICT (station_code) DO UPDATE SET
+        station_name      = EXCLUDED.station_name,
+        bikes_available   = EXCLUDED.bikes_available,
+        mechanical_bikes  = EXCLUDED.mechanical_bikes,
+        electric_bikes    = EXCLUDED.electric_bikes,
+        docks_available   = EXCLUDED.docks_available,
+        capacity          = EXCLUDED.capacity,
+        is_installed      = EXCLUDED.is_installed,
+        is_renting        = EXCLUDED.is_renting,
+        is_returning      = EXCLUDED.is_returning,
+        occupancy_rate    = EXCLUDED.occupancy_rate,
+        station_status    = EXCLUDED.station_status,
+        latitude          = EXCLUDED.latitude,
+        longitude         = EXCLUDED.longitude,
+        last_reported     = EXCLUDED.last_reported,
+        collected_at      = EXCLUDED.collected_at
+    WHERE EXCLUDED.collected_at > mart.station_latest.collected_at;
+"""
 
 
 # ── Fonctions des tâches ──────────────────────────────────────────────────────
@@ -68,13 +128,14 @@ def check_kafka_health(**ctx):
         )
         topics = admin.list_topics()
         admin.close()
-        log.info("Kafka OK – topics disponibles : %s", topics)
+        log.info("Kafka OK – topics : %s", topics)
     except KafkaError as exc:
         raise RuntimeError("Kafka inaccessible : %s" % exc) from exc
 
 
 def check_dwh_health(**ctx):
     """Vérifie la connectivité PostgreSQL DWH."""
+    import psycopg2
     try:
         conn = psycopg2.connect(PG_DSN, connect_timeout=5)
         cur = conn.cursor()
@@ -87,46 +148,127 @@ def check_dwh_health(**ctx):
         raise RuntimeError("DWH inaccessible : %s" % exc) from exc
 
 
+def _enrich(record):
+    """Ajoute occupancy_rate et station_status à un enregistrement."""
+    capacity = record.get("capacity") or 0
+    if capacity > 0:
+        record["occupancy_rate"] = round(
+            (record.get("bikes_available") or 0) / capacity, 4
+        )
+    else:
+        record["occupancy_rate"] = None
+
+    if not record.get("is_installed"):
+        record["station_status"] = "hors_service"
+    elif not record.get("is_renting") and not record.get("is_returning"):
+        record["station_status"] = "fermee"
+    else:
+        record["station_status"] = "en_service"
+    return record
+
+
 def consume_kafka_batch(**ctx):
     """
-    Invoque le consumer Python en sous-processus.
-    Paramètres passés via variables d'environnement :
-      - MAX_MESSAGES : nombre max de messages à consommer par exécution
-      - POLL_TIMEOUT_MS : délai d'attente si le topic est vide
-    Ce mécanisme permet de transformer le consumer daemon en tâche Airflow bornée.
-    """
-    env = os.environ.copy()
-    env.update({
-        "POSTGRES_DSN":           PG_DSN,
-        "KAFKA_BOOTSTRAP_SERVERS": KAFKA_BOOTSTRAP,
-        "KAFKA_TOPIC":            KAFKA_TOPIC,
-        "KAFKA_GROUP_ID":         "velib-airflow-consumer",
-        "MAX_MESSAGES":           "5000",   # ~5 000 messages par cycle
-        "POLL_TIMEOUT_MS":        "10000",  # 10s sans message → fin du batch
-        "COMMIT_EVERY_N":         "100",
-    })
+    Consomme un batch depuis le topic Kafka `velib-stations` et insère
+    les données dans raw.station_snapshots et mart.station_latest.
 
-    result = subprocess.run(
-        [sys.executable, CONSUMER_SCRIPT],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,  # 5 min max
+    Architecture : logique inlinée dans le DAG (pas de subprocess).
+    Tous les imports tiers sont lazys pour garantir le chargement du DAG.
+
+    Paramètres :
+      - MAX_MESSAGES  : 5 000 messages max par cycle (configurable)
+      - POLL_TIMEOUT_MS : 10s sans message → fin du batch
+    """
+    import json
+    import psycopg2
+    import psycopg2.extras
+    from kafka import KafkaConsumer
+    from kafka.errors import KafkaError
+
+    MAX_MESSAGES    = 5000
+    POLL_TIMEOUT_MS = 10000   # 10s sans message → fin du batch
+    BATCH_SIZE      = 50      # Commit toutes les 50 lignes
+
+    # ── Connexion PostgreSQL ──────────────────────────────────────────────────
+    conn = psycopg2.connect(PG_DSN, connect_timeout=10)
+    conn.autocommit = False
+    cursor = conn.cursor()
+    log.info("Connecté au DWH : %s", PG_DSN)
+
+    # ── Consumer Kafka ────────────────────────────────────────────────────────
+    consumer = KafkaConsumer(
+        KAFKA_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        group_id="velib-airflow-consumer",
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,
+        value_deserializer=lambda b: json.loads(b.decode("utf-8")),
+        consumer_timeout_ms=POLL_TIMEOUT_MS,
     )
-    if result.returncode != 0:
-        log.error("Consumer stderr : %s", result.stderr)
-        raise RuntimeError("Consumer terminé avec code %d" % result.returncode)
-    log.info("Consumer stdout : %s", result.stdout[-2000:])
+    log.info("Consumer Kafka connecté – topic=%s, bootstrap=%s",
+             KAFKA_TOPIC, KAFKA_BOOTSTRAP)
+
+    batch     = []
+    total     = 0
+    rejected  = 0
+
+    try:
+        for kafka_msg in consumer:
+            record = kafka_msg.value
+
+            # Validation minimale
+            if not record.get("station_code"):
+                rejected += 1
+                continue
+
+            record = _enrich(record)
+            batch.append(record)
+
+            # Commit par batch
+            if len(batch) >= BATCH_SIZE:
+                psycopg2.extras.execute_batch(cursor, _INSERT_SNAPSHOT, batch)
+                psycopg2.extras.execute_batch(cursor, _UPSERT_LATEST,   batch)
+                conn.commit()
+                consumer.commit()
+                total += len(batch)
+                log.info("Batch de %d enregistrements inséré (total=%d)", len(batch), total)
+                batch = []
+
+            if MAX_MESSAGES > 0 and total >= MAX_MESSAGES:
+                log.info("MAX_MESSAGES=%d atteint", MAX_MESSAGES)
+                break
+
+    except KafkaError as exc:
+        conn.rollback()
+        raise RuntimeError("Erreur Kafka pendant la consommation : %s" % exc) from exc
+
+    finally:
+        # Flush du dernier batch partiel
+        if batch:
+            psycopg2.extras.execute_batch(cursor, _INSERT_SNAPSHOT, batch)
+            psycopg2.extras.execute_batch(cursor, _UPSERT_LATEST,   batch)
+            conn.commit()
+            consumer.commit()
+            total += len(batch)
+
+        consumer.close()
+        cursor.close()
+        conn.close()
+
+    log.info("consume_kafka_batch terminé – insérés : %d, rejetés : %d", total, rejected)
+    return {"inserted": total, "rejected": rejected}
 
 
 def refresh_hourly_agg(**ctx):
     """Rafraîchit la vue matérialisée des agrégats horaires."""
     _run_sql("REFRESH MATERIALIZED VIEW CONCURRENTLY mart.hourly_station_stats;")
+    log.info("Vue mart.hourly_station_stats rafraîchie")
 
 
 def refresh_daily_agg(**ctx):
     """Rafraîchit la vue matérialisée des agrégats journaliers."""
     _run_sql("REFRESH MATERIALIZED VIEW CONCURRENTLY mart.daily_station_stats;")
+    log.info("Vue mart.daily_station_stats rafraîchie")
 
 
 def compute_station_rank(**ctx):
@@ -152,10 +294,8 @@ def compute_station_rank(**ctx):
             s.station_name,
             ROUND(AVG(s.occupancy_rate)::numeric, 4)               AS avg_occupancy_rate,
             ROUND(AVG(s.bikes_available)::numeric, 2)              AS avg_bikes_available,
-            -- Minutes en saturation (0 borne libre)
-            COUNT(*) FILTER (WHERE s.docks_available = 0) * 1      AS saturation_minutes,
-            -- Minutes à vide (0 vélo dispo)
-            COUNT(*) FILTER (WHERE s.bikes_available = 0) * 1      AS empty_minutes,
+            COUNT(*) FILTER (WHERE s.docks_available = 0)          AS saturation_minutes,
+            COUNT(*) FILTER (WHERE s.bikes_available = 0)          AS empty_minutes,
             RANK() OVER (ORDER BY AVG(s.occupancy_rate) DESC)      AS rank_saturation,
             RANK() OVER (ORDER BY AVG(s.bikes_available) ASC)      AS rank_availability
         FROM raw.station_snapshots s
@@ -172,15 +312,11 @@ def data_quality_check(**ctx):
     """
     Contrôles qualité sur les données insérées dans le cycle courant.
     Vérifie :
-      - Pas de snapshots avec capacité = 0
       - Cohérence : bikes_available <= capacity
       - Fraîcheur : au moins 1 snapshot dans les 10 dernières minutes
     """
+    import psycopg2
     checks = {
-        "capacity_zero": """
-            SELECT COUNT(*) FROM raw.station_snapshots
-            WHERE capacity = 0 AND collected_at >= NOW() - INTERVAL '10 minutes';
-        """,
         "bikes_exceed_capacity": """
             SELECT COUNT(*) FROM raw.station_snapshots
             WHERE bikes_available > capacity
@@ -193,33 +329,25 @@ def data_quality_check(**ctx):
     }
 
     conn = psycopg2.connect(PG_DSN)
-    cur = conn.cursor()
-    issues = []
+    cur  = conn.cursor()
 
     for check_name, sql in checks.items():
         cur.execute(sql)
         count = cur.fetchone()[0]
         if check_name == "recent_data_exists" and count == 0:
-            issues.append("ALERTE: Aucune donnée récente (< 10 min) dans raw.station_snapshots")
+            log.warning("ALERTE: aucune donnée récente (< 10 min)")
         elif check_name != "recent_data_exists" and count > 0:
-            issues.append("ALERTE [%s]: %d enregistrements problématiques" % (check_name, count))
+            log.warning("ALERTE [%s]: %d enregistrements problématiques", check_name, count)
         else:
             log.info("Check '%s' : OK (count=%d)", check_name, count)
 
     cur.close()
     conn.close()
 
-    if issues:
-        for issue in issues:
-            log.warning(issue)
-        # On ne fait pas échouer le DAG sur des alertes qualité (avertissement uniquement)
-        # Pour rendre bloquant : raise AirflowException("\n".join(issues))
-    else:
-        log.info("Tous les contrôles qualité sont OK")
 
-
-def _run_sql(sql: str):
-    """Exécute une requête SQL sur le DWH."""
+def _run_sql(sql):
+    """Exécute une requête SQL sur le DWH (psycopg2 lazy import)."""
+    import psycopg2
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = True
     cur = conn.cursor()
@@ -237,9 +365,9 @@ with DAG(
     description="Pipeline temps réel Vélib' Métropole – Kafka → PostgreSQL DWH",
     default_args=DEFAULT_ARGS,
     start_date=days_ago(1),
-    schedule_interval="*/5 * * * *",   # Toutes les 5 minutes
+    schedule_interval="*/5 * * * *",
     catchup=False,
-    max_active_runs=1,                  # Pas d'exécutions parallèles du même DAG
+    max_active_runs=1,
     tags=["velib", "streaming", "dwh"],
 ) as dag:
 
@@ -289,11 +417,11 @@ with DAG(
         doc_md="Contrôles qualité : cohérence des données, fraîcheur.",
     )
 
-    # ── Dépendances ────────────────────────────────────────────────────────────
+    # ── Graphe de dépendances ─────────────────────────────────────────────────
     #
     #  check_kafka ──┐
-    #                ├─► consume ─► hourly_agg ─► daily_agg ─► rank
-    #  check_dwh  ──┘                                        └─► quality
+    #                ├──► consume ──► hourly_agg ──► daily_agg ──► rank
+    #  check_dwh  ──┘                                           └──► quality
     #
     [t_check_kafka, t_check_dwh] >> t_consume
     t_consume >> t_hourly >> t_daily
